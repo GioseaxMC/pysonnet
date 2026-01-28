@@ -1,5 +1,8 @@
 from random import randint
 import struct
+
+import attr
+from distro import name
 # per field ids are useless till i implement single field change tracking, for speed purposes i wont right now
 
 def take(n: int, b: bytes):
@@ -9,31 +12,29 @@ class Fields:
     class Field:
         def __init__(self, name):
             self.name = name
-            self.value = None
             self.id: int = -1
         
         def __set__(self, value):
-            # send to change buffer
-            # print(f"Setting {self.name} to {value}")
             self.value = value
 
         def __get__(self):
-            # print(f"Getting {self.name} value")
             return self.value
 
     def int(_name):
         class Int(Fields.Field):
             def __init__(self):
                 super().__init__(_name)
+                self.value = 0
 
             def struct_type(self):
-                return "I"
+                return "i"
         return Int
 
     def float(_name):
         class Float(Fields.Field):
             def __init__(self):
                 super().__init__(_name)
+                self.value = 0.0
 
             def struct_type(self):
                 return "f"
@@ -53,24 +54,22 @@ class SharedObjects:
         raise NotImplementedError("Network communication not implemented, replace this function with a callback:\n\tsharedObjects.send = callback_function")
 
     def on_receive_callback(self, data: bytes): # not sure yet
-        print(f"ON RECEIVE CALLBACK")
         # "Network communication, put this function into your handler and feed it the bytes"
         while len(data):
             type, data = take(1, data)
-            print(f"Received message of type and data is: {data}")
             if type == b"c":
-                print("Received creation")
+                # print("Received creation")
                 description, data = take(4+64, data)
                 created_id, name_and_signature = struct.unpack("<I64s", description) #returns int and bytes
                 if created_id in self.object_database:
                     return # already exists
                 name, signature = name_and_signature.decode().strip("\x00").split("|", 1)
-                print(name, signature)
+                # print(name, signature)
 
                 if name not in self.shared_classes:
                     raise ValueError(f"Received creation for unknown shared class: {name}") # :)
                 
-                print(self.shared_classes[name])
+                # print(self.shared_classes[name])
                 instance = self.shared_classes[name](__id = created_id)
                 self.shared_classes[name]._spawn_callback(instance)
                 self.object_database[created_id] = instance
@@ -86,11 +85,12 @@ class SharedObjects:
                     field.value = value
 
             elif type == b"u":
+                # print("Received update")
                 description, data = take(4, data)
                 update_id, = struct.unpack("<I", description)
 
                 if not update_id in self.object_database:
-                    data = b"" # unknown object, discard rest of data, will lose some updates
+                    data = b"abc" # unknown object, discard rest of data, will lose some updates
                     self.send(b"?" + struct.pack("<I", update_id))
                     return
 
@@ -105,16 +105,20 @@ class SharedObjects:
                     field.value = value
 
             elif type == b"?":
+                # print("Received request for unknown object")
                 description, data = take(4, data)
                 asked_id, = struct.unpack("<I", description)
+                if asked_id not in self.object_database:
+                    return # dont bother sending, the owners will
                 self.send_creation(self.object_database[asked_id], self.object_database[asked_id]._shared_class_name)
             else:
                 ...
 
     def send_creation(self, instance, instance_name): # announce to the network the object now exists
         fields_format = instance.struct_signature()
+        # print(fields_format)
         data = struct.pack(
-            "=cI64s"+fields_format,
+            "<cI64s"+fields_format,
             b"c",
             instance.id,
             (instance_name + "|" + fields_format).encode(),
@@ -123,10 +127,12 @@ class SharedObjects:
         self.send(data)
 
     def send_updates(self):
+        if not len(self.changed):
+            return
         data = b""
         for instance in self.changed:
             data += struct.pack(
-                "=cI"+instance.struct_signature(),
+                "<cI"+instance.struct_signature(),
                 b"u",
                 instance.id,
                 *(f.value for f in instance._fields)
@@ -137,25 +143,56 @@ class SharedObjects:
     def create(outer_self, shared_class_name, parent_class, *fields, spawn_callback=None):
         class Shared(parent_class):
             def __init__(self, *args, **kwargs):
+                super().__setattr__("__initializing", True)
                 __id = kwargs.get("__id", -1)
                 if "__id" in kwargs:
                     del kwargs["__id"]
 
-                super().__setattr__("_fields", list(f() for f in fields))
-                for f in self._fields: #fields id will act like hosts inside a network, can have at most 255 fields
-                    super().__setattr__(f.name, f)
+                
+                self._fields = list()
+                for f in fields:
+                    field = f()
+                    self._fields.append(field)
+                    super().__setattr__(field.name, field)
+
+                # print(self._fields)
 
                 super().__init__(*args, **kwargs)
-                super().__setattr__("_spawn_callback", spawn_callback)
-                super().__setattr__("_shared_class_name", shared_class_name)
-
+                self._spawn_callback = spawn_callback
+                self._shared_class_name = shared_class_name
+                self.id: int
+                
                 if __id == -1: #created locally
                     self.set_id()
                     outer_self.send_creation(self, shared_class_name)
                     outer_self.shared_classes[shared_class_name] = Shared
                 else: # created remotely
                     self.set_id(__id)
+                super().__setattr__("__initializing", False)
 
+            def __setattr__(self, name, value):
+                # print(f"Setting attribute {name} to {value}")
+                if not hasattr(super(), name) and super().__getattribute__("__initializing"):
+                    # print("Initializing new attribute with type", type(value))
+                    super().__setattr__(name, value)
+                attr = super().__getattribute__(name)
+                if isinstance(attr, Fields.Field):
+                    # print(f"Attribute {name} is a Field, setting value")
+                    old = attr.value
+                    attr.value = value
+                    if old != value:
+                        # print(f"Attribute {name} changed from {old} to {value}")
+                        outer_self.changed.add(self) # append only a reference to the instance
+                else:
+                    super().__setattr__(name, value)
+
+            def __getattribute__(self, name):
+                # print(f"Getting attribute {name}")
+                attr = super().__getattribute__(name)
+                if isinstance(attr, Fields.Field):
+                    return attr.__get__()
+                return attr
+            
             def _spawn_callback(self):
                 if spawn_callback:
                     spawn_callback(self)
@@ -165,29 +202,31 @@ class SharedObjects:
                     id = randint(0, 2**32) & 0xFF_FF_FF_00
                 
                 outer_self.object_database[id] = self
-                super().__setattr__("id", id)
+                self.id = id
                 for field in self._fields:
                     id += 1
                     field.id = id
 
-            def __getattribute__(self, name):
-                attr = super().__getattribute__(name)
-                if isinstance(attr, Fields.Field):
-                    return attr.__get__()
-                return attr
+            # def __getattribute__(self, name):
+            #     attr = super().__getattribute__(name)
+            #     if isinstance(attr, Fields.Field):
+            #         return attr.__get__()
+            #     return attr
 
-            def __setattr__(self, name, value):
-                attr = super().__getattribute__(name)
-                if isinstance(attr, Fields.Field):
-                    attr.__set__(value)
+            # def __setattr__(self, name, value):
+            #     attr = super().__getattribute__(name)
+            #     if isinstance(attr, Fields.Field):
+            #         old = attr.__get__()
+            #         attr.__set__(value)
 
-                    # TODO: implement proper change tracking
-                    # for now use the object id, change tracking for now is just dumping the whole struct into the network
-                    # potentially i could even not track changes at all and just track which struct has changed with a flag, or add the struct to a list (which would be faster)
-                    # then i could just send the whole struct every time, we'll see
-                    outer_self.changed.add(self) # append only a reference to the instance
-                else:
-                    super().__setattr__(name, value)
+            #         # TODO: implement proper change tracking
+            #         # for now use the object id, change tracking for now is just dumping the whole struct into the network
+            #         # potentially i could even not track changes at all and just track which struct has changed with a flag, or add the struct to a list (which would be faster)
+            #         # then i could just send the whole struct every time, we'll see
+            #         if old != value:
+            #             outer_self.changed.add(self) # append only a reference to the instance
+            #     else:
+            #         super().__setattr__(name, value)
 
             def struct_signature(self):
                 return "".join(f.struct_type() for f in self._fields)
@@ -202,7 +241,7 @@ def main():
             self.age = 30
 
     sharedObjects = SharedObjects()
-    sharedObjects.send = lambda data: print(f"Sending data: {data}")
+    # sharedObjects.send = lambda data: print(f"Sending data: {data}")
 
     SharedPerson = sharedObjects.create("person", Person, 
         Fields.Float("height"),
