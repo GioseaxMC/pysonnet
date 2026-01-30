@@ -1,23 +1,25 @@
 import pysonnet as son
-import paho.mqtt.client as mqtt
-import threading as t
+from server import SocketServer, SocketClient
+from sys import argv
 from random import randint
 
-#use latest version of api
-client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, clean_session=True)
-client.connect("test.mosquitto.org", 1883, 60)
-client.subscribe("pysonnet")
-client_id = randint(0x0, 0xFFFFFFFF).to_bytes(4, "little")
-
 sharedObjects = son.SharedObjects()
-sharedObjects.send = lambda payload: client.publish("pysonnet", client_id+payload)
+PORT = int(argv[2])
+if "server" in argv:
+    sh = SocketServer("127.0.0.1", PORT)
+    sh.on_connect = lambda conn, addr: print("Sigma balls")
+    def rotate_message(data, addr, conn):
+        for c, a in sh.connections:
+            if conn != c:
+                c.send(data)
+    sh.on_receive = rotate_message
+    sh.loop_forever()
 
-def on_recv(client, userdata, msg):
-    if not msg.payload.startswith(client_id):
-        # print(f"Received message: {msg.payload}")
-        sharedObjects.on_receive_callback(son.take(4, msg.payload)[1])
-client.on_message = on_recv
-t.Thread(target=client.loop_forever, daemon=True).start()
+sc = SocketClient("127.0.0.1", PORT)
+def on_recv(conn, data):
+    sharedObjects.on_receive_callback(data)
+sc.on_receive = on_recv
+sharedObjects.send = lambda payload: sc.send(payload)
 
 class Square:
     def __init__(self):
@@ -61,5 +63,5 @@ while c.loop(60):
         color = "black"
     )
 
-    if not c.get_frames() % 10:
+    if not c.get_frames() % 1:
         sharedObjects.send_updates()
